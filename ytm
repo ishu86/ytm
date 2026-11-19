@@ -1,0 +1,215 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+
+set -o pipefail
+
+usage() {
+    cat <<'EOF'
+ytm                 Open the full-screen player
+ytm ui              Open the full-screen player
+ytm menu            Open the numbered menu
+ytm <words>         Search YouTube Music for songs
+ytm song <words>    Search YouTube Music for songs
+ytm video <words>   Search YouTube for videos and play their audio
+ytm play <source>   Play audio from a URL or local file
+
+In command-line search, choose a result by number.
+Space pauses, Left/Right seek, and q quits.
+EOF
+}
+
+fail() {
+    printf 'ytm: %s\n' "$1" >&2
+    exit 1
+}
+
+open_menu() {
+    local choice prompt input
+    printf '\nytm\n\n  1  Search YouTube Music\n  2  Search YouTube videos\n  3  Play a link or local file\n\n' >&2
+    while true; do
+        printf 'Choose [1-3, Enter quits]: ' >&2
+        IFS= read -r choice || return 1
+        case $choice in
+            '') return 1 ;;
+            1) mode=song; prompt='Song or artist'; break ;;
+            2) mode=video; prompt='Video search'; break ;;
+            3) mode=play; prompt='Paste a link or type a file path'; break ;;
+        esac
+    done
+
+    printf '%s [Enter cancels]: ' "$prompt" >&2
+    IFS= read -r input || return 1
+    [[ -n $input ]] || return 1
+    if [[ $mode == play ]]; then
+        source=$input
+        case $source in
+            '~/'*) source="$HOME/${source:2}" ;;
+        esac
+    else
+        query=$input
+    fi
+}
+
+music_tracks() {
+    exec uvx --no-progress --from ytmusicapi python - "$@" <<'PY'
+import sys
+
+from ytmusicapi import YTMusic
+
+mode, value = sys.argv[1:]
+discover = mode == "discover"
+limit = 20 if discover else 10
+try:
+    music = YTMusic()
+    if discover:
+        songs = music.get_watch_playlist(videoId=value, radio=True, limit=limit + 1).get("tracks") or []
+    else:
+        songs = music.search(value, filter="songs", limit=limit)
+except Exception as error:
+    sys.exit(f"YouTube Music lookup failed: {error}")
+
+seen = {value} if discover else set()
+count = 0
+for song in songs:
+    video_id = song.get("videoId")
+    if not video_id or video_id in seen:
+        continue
+    artist = ", ".join(a["name"] for a in (song.get("artists") or []) if a.get("name"))
+    if discover and not artist:
+        continue
+    label = " | ".join(filter(None, (song["title"], artist, song.get("duration") or song.get("length"))))
+    label = "".join(c if c.isprintable() else " " for c in label)
+    artist = "".join(c if c.isprintable() else " " for c in artist)
+    print(f"{video_id}\t{label}\t{artist}")
+    seen.add(video_id)
+    count += 1
+    if count == limit:
+        break
+PY
+}
+
+search_videos() {
+    yt-dlp --ignore-config --flat-playlist --skip-download --dump-json -- "ytsearch10:$1" |
+        jq -r 'select(.id and .title) | [.id, ([.title, (.channel // .uploader)]
+            | map(select(. != null) | gsub("[[:cntrl:]]"; " ")) | join(" | "))] | @tsv'
+}
+
+resolve_stream() {
+    exec yt-dlp --ignore-config --no-playlist --no-warnings \
+        --socket-timeout 8 --retries 1 --extractor-retries 1 \
+        -f 'bestaudio[protocol^=m3u8]' --print '%(title)S' --print '%(url)s' -- "$1"
+}
+
+launcher=$(/bin/realpath "$0") || fail 'Could not locate the ytm launcher.'
+native_dir="${launcher%/*}/src"
+player_cache="${XDG_CACHE_HOME:-$HOME/.cache}/ytm"
+player="$player_cache/player"
+build_player() {
+    local files=("$native_dir/player.m" "$native_dir/tui.m" "$native_dir/taste.m" "$native_dir/taste.h")
+    local stale=0 file
+    for file in "${files[@]}"; do
+        [[ -r $file ]] || return 1
+        [[ $file -nt $player ]] && stale=1
+    done
+    [[ -x $player && $stale == 0 ]] && return 0
+    mkdir -p -- "$player_cache" || return 1
+    local temporary
+    temporary=$(mktemp "$player_cache/player.XXXXXXXX") || return 1
+    if xcrun clang -O2 -fobjc-arc -Wall -Wextra \
+        -framework AVFoundation -framework Foundation -framework CoreMedia -lncurses -lsqlite3 \
+        "${files[@]:0:3}" -o "$temporary" && mv -f -- "$temporary" "$player"; then
+        return 0
+    fi
+    /bin/unlink "$temporary"
+    return 1
+}
+
+source=''
+query=''
+[[ $# == 0 && -t 0 && -t 1 ]] && set -- ui
+case ${1-} in
+    ''|help|-h|--help) usage; exit ;;
+    ui)
+        [[ $# == 1 && -t 0 && -t 1 ]] || fail 'Run ytm ui in an interactive terminal.'
+        build_player || fail 'Could not build the full-screen player. Try ytm menu.'
+        exec "$player" tui "$launcher"
+        ;;
+    menu)
+        [[ $# == 1 && -t 0 && -t 2 ]] || fail 'Run ytm menu in an interactive terminal.'
+        open_menu || exit 0
+        ;;
+    --search)
+        [[ $# == 3 ]] || exit 64
+        case $2 in song) music_tracks search "$3" ;; video) search_videos "$3" ;; *) exit 64 ;; esac
+        exit $?
+        ;;
+    --discover)
+        [[ $# == 2 && $2 =~ ^[A-Za-z0-9_-]{11}$ ]] || exit 64
+        music_tracks discover "$2"
+        ;;
+    --resolve)
+        [[ $# == 2 ]] || exit 64
+        resolve_stream "$2"
+        ;;
+    play)
+        [[ $# == 2 && -n $2 ]] || fail 'Usage: ytm play <URL or path>'
+        source=$2
+        ;;
+    song|video) mode=$1; shift; query="$*" ;;
+    *) mode=song; query="$*" ;;
+esac
+
+if [[ -z $source ]]; then
+    [[ -n $query ]] || fail 'Enter a song or video to search for.'
+    [[ -t 2 ]] && printf 'Searching...\n' >&2
+    case $mode in
+        song) results=$(music_tracks search "$query") || exit 1 ;;
+        video) results=$(search_videos "$query") || exit 1 ;;
+    esac
+
+    ids=()
+    while IFS=$'\t' read -r id label artist; do
+        [[ $id =~ ^[A-Za-z0-9_-]{11}$ ]] || continue
+        ids+=("$id")
+        printf '%2d. %s\n' "${#ids[@]}" "$label" >&2
+    done <<< "$results"
+    count=${#ids[@]}
+    (( count > 0 )) || fail 'No playable results found.'
+
+    while true; do
+        printf 'Play [1-%d, Enter cancels]: ' "$count" >&2
+        read -r choice || exit 0
+        [[ -n $choice ]] || exit 0
+        if [[ $choice =~ ^([1-9]|10)$ ]] && (( choice <= count )); then
+            source="https://www.youtube.com/watch?v=${ids[choice-1]}"
+            break
+        fi
+    done
+fi
+
+status=69
+if build_player; then
+    case $source in
+        http://*|https://*)
+            if stream=$(resolve_stream "$source" 2>/dev/null) &&
+                [[ ${stream##*$'\n'} == https://* ]]; then
+                "$player" hls "${stream##*$'\n'}" "${stream%%$'\n'*}"
+                status=$?
+            fi
+            ;;
+        *)
+            "$player" file "$source" "${source##*/}"
+            status=$?
+            ;;
+    esac
+fi
+[[ $status == 69 ]] || exit "$status"
+
+command -v mpv >/dev/null || fail 'This source requires mpv. Install it with brew install mpv.'
+printf 'ytm: Using mpv for this source.\n' >&2
+exec mpv --no-config --no-video --no-audio-display \
+    --no-osc --no-load-console --no-load-stats-overlay --no-load-select \
+    --no-load-context-menu --no-load-positioning --no-load-auto-profiles --no-load-commands \
+    --demuxer-max-bytes=2MiB --demuxer-max-back-bytes=512KiB \
+    --ytdl-format='bestaudio[protocol=https]/bestaudio/best' \
+    --ytdl-raw-options=ignore-config=,no-playlist= -- "$source"
