@@ -2,6 +2,8 @@
 
 Play YouTube Music, YouTube videos, and local audio in a macOS terminal. Search, queue, and control playback with the keyboard or mouse. **For You** ranks tracks on your Mac using likes, listens, and skips.
 
+![ytm searching, queueing and playing music in a terminal](assets/demo.gif)
+
 ## Run
 
 On macOS 14 or later, install Apple's Command Line Tools with `xcode-select --install` and install the dependencies with Homebrew:
