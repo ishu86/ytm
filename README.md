@@ -4,7 +4,16 @@ Play YouTube Music, YouTube videos, and local audio in a macOS terminal. Search,
 
 ![ytm searching, queueing and playing music in a terminal](assets/demo.gif)
 
-## Run
+## Install
+
+On macOS 14 or later:
+
+```sh
+brew install ishu86/ytm/ytm
+ytm
+```
+
+## Run from source
 
 On macOS 14 or later, install Apple's Command Line Tools with `xcode-select --install` and install the dependencies with Homebrew:
 
